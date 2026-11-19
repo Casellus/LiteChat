@@ -25,7 +25,18 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
 - **System tray icon**: the close button hides the window and notifications keep arriving.
   - Left click on the icon: show or hide the window.
   - Right click: Open, Reload and Quit.
-- **Unread chat count** in the window title and tray tooltip, for example `(3) LiteChat`.
+- **Unread badge** like the official app:
+  - a number on the taskbar button;
+  - a red dot on the tray icon;
+  - the count in the window title, for example `(3) LiteChat`.
+- The taskbar button **flashes** when a new message arrives while the window is in the background.
+- **Notifications work out of the box**. Clicking one brings LiteChat to the front.
+- **Calls and voice messages** work without extra prompts: microphone, camera, notification and clipboard permissions are granted to WhatsApp only.
+- **Single instance**: launching LiteChat again just shows the existing window.
+- **Start with Windows** toggle in the tray menu. When started this way, it starts hidden in the tray.
+- Window size, position and maximized state are **remembered**.
+- **Clean right-click menu**: browser-only entries such as Back, Reload, Print and Save as are removed. Copy, paste and spell check stay.
+- Drag and drop files into chats.
 - External links open in your default browser.
 - Automatic **low-memory mode** while the window is hidden.
 - WebView2 tuning, with the effect of each option measured:

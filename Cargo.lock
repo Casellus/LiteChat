@@ -1138,6 +1138,7 @@ dependencies = [
  "tao",
  "tray-icon",
  "webview2-com",
+ "windows",
  "windows-core",
  "winresource",
  "wry",
