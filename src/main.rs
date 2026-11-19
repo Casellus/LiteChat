@@ -3,6 +3,7 @@
 #![windows_subsystem = "windows"]
 
 mod platform;
+mod toast;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,6 +67,7 @@ enum UserEvent {
     Menu(MenuEvent),
     Title(String),
     Show,
+    ToastClicked(String),
 }
 
 /// Domains that stay inside the app; everything else opens in the browser.
@@ -201,6 +203,7 @@ fn main() -> wry::Result<()> {
     let data = data_dir();
     let _ = std::fs::create_dir_all(&data);
     let state_file = data.join("window.txt");
+    toast::register(include_bytes!("../assets/litechat.png"), &data);
 
     let mut builder = WindowBuilder::new()
         .with_title(APP_NAME)
@@ -277,6 +280,10 @@ fn main() -> wry::Result<()> {
     let core = webview.webview();
     platform::auto_grant_permissions(&core);
     platform::clean_context_menu(&core);
+    let toast_proxy = event_loop.create_proxy();
+    toast::hook(&core, move |tag| {
+        let _ = toast_proxy.send_event(UserEvent::ToastClicked(tag));
+    });
     if start_hidden {
         set_low_memory(&webview, true);
     }
@@ -310,6 +317,10 @@ fn main() -> wry::Result<()> {
                 focused = f;
             }
             Event::UserEvent(UserEvent::Show) => show_window(&window, &webview),
+            Event::UserEvent(UserEvent::ToastClicked(tag)) => {
+                show_window(&window, &webview);
+                toast::clicked(&tag);
+            }
             Event::UserEvent(UserEvent::Title(title)) => {
                 let count = unread_from_title(&title);
                 let label = if count > 0 {

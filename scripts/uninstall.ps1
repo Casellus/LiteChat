@@ -14,6 +14,8 @@ Remove-Item (Join-Path ([Environment]::GetFolderPath('Programs')) "$AppName.lnk"
 Remove-Item (Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName.lnk") -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $AppName -ErrorAction SilentlyContinue
 Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppName" -Recurse -ErrorAction SilentlyContinue
+# Notification sender registration (name and icon shown on toasts)
+Remove-Item -Path 'HKCU:\Software\Classes\AppUserModelId\LiteChat.Desktop' -Recurse -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($RemoveData) {

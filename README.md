@@ -30,7 +30,11 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
   - a red dot on the tray icon;
   - the count in the window title, for example `(3) LiteChat`.
 - The taskbar button **flashes** when a new message arrives while the window is in the background.
-- **Notifications work out of the box**. Clicking one brings LiteChat to the front.
+- **Native Windows notifications**: WhatsApp messages arrive as real Windows toasts instead of browser popups.
+  - They show up in the Action Center and follow Focus / Do Not Disturb.
+  - Notification widgets such as "dynamic island" apps can pick them up.
+  - Clicking one opens LiteChat on that chat.
+  - Reading the chat removes the notification.
 - **Calls and voice messages** work without extra prompts: microphone, camera, notification and clipboard permissions are granted to WhatsApp only.
 - **Single instance**: launching LiteChat again just shows the existing window.
 - **Start with Windows** toggle in the tray menu. When started this way, it starts hidden in the tray.
