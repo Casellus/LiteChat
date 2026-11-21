@@ -4,11 +4,11 @@
 
 <h1 align="center">LiteChat</h1>
 
-<p align="center">A featherweight desktop client for WhatsApp Web on Windows.</p>
+<p align="center">A featherweight desktop client for WhatsApp Web on Windows and Linux.</p>
 
 ---
 
-LiteChat opens the **official WhatsApp Web** in a native window. It uses the WebView2 engine that already ships with Windows instead of bundling a whole browser. The design, settings and features are WhatsApp's own, and you sign in with a **QR code** just like in the regular app.
+LiteChat opens the **official WhatsApp Web** in a native window. It uses the system WebView (WebView2 on Windows, WebKitGTK on Linux) instead of bundling a whole browser. The design, settings and features are WhatsApp's own, and you sign in with a **QR code** just like in the regular app.
 
 ## Why
 
@@ -97,6 +97,29 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\LiteChat\un
 ```
 
 Without `-RemoveData` the session is kept in `%LOCALAPPDATA%\LiteChat`.
+
+### Linux
+
+Requirements: GTK 3 and WebKitGTK 4.1 (`webkit2gtk-4.1` and `gtk3` development packages to build). Install `gst-plugins-good` for audio, voice messages, and calls; if `autoaudiosink` is missing, LiteChat disables WebKit media playback automatically so WebKitGTK does not abort on audio events.
+
+```bash
+git clone https://github.com/Casellus/LiteChat.git
+cd LiteChat
+cargo build --release
+./scripts/install.sh
+```
+
+`install.sh` installs the binary to `~/.local/bin/litechat`, copies the icon to `~/.local/share/icons/hicolor/256x256/apps/litechat.png`, and adds a desktop entry in `~/.local/share/applications/litechat.desktop`. Pass `--autostart` to start hidden on login.
+
+To uninstall:
+
+```bash
+./scripts/uninstall.sh --remove-data
+```
+
+Without `--remove-data`, the session stays in `~/.local/share/LiteChat`.
+
+On Linux, set `LITECHAT_DISABLE_GPU=1` if you want to disable hardware acceleration in WebKitGTK.
 
 ## Development
 
