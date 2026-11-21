@@ -21,22 +21,6 @@ const DESKTOP_ID: &str = "litechat.desktop";
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
-/// Sets WebKitGTK environment workarounds before GTK/WebKit initializes.
-/// Must be called at the very start of `main()` before any threads are spawned.
-pub fn init_env() {
-    // WebKitGTK's DMA-BUF renderer freezes after idling or hiding on Wayland
-    // (especially on NVIDIA). Disable it by default on Wayland unless the user
-    // explicitly configured WEBKIT_DISABLE_DMABUF_RENDERER.
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
-    {
-        // SAFETY: called at process startup before any threads are spawned.
-        unsafe {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Data directory & external links
 // ---------------------------------------------------------------------------
