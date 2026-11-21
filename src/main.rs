@@ -265,8 +265,7 @@ fn main() -> wry::Result<()> {
     let title_proxy = event_loop.create_proxy();
     let ipc_proxy = event_loop.create_proxy();
 
-    let wv_builder = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url(WHATSAPP_URL)
+    let mut wv_builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_devtools(cfg!(debug_assertions))
         .with_initialization_script_for_main_only(NOTIFICATION_CLICK_JS, true)
         .with_ipc_handler(move |req| {
@@ -290,8 +289,14 @@ fn main() -> wry::Result<()> {
             let _ = title_proxy.send_event(UserEvent::Title(title));
         });
 
+    #[cfg(target_os = "linux")]
+    if !platform::has_gstreamer_audio_sink() {
+        wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
+    }
+
     #[cfg(target_os = "windows")]
     let webview = wv_builder
+        .with_url(WHATSAPP_URL)
         .with_additional_browser_args(match std::env::var("LITECHAT_EXTRA_ARGS") {
             Ok(extra) => format!("{BROWSER_ARGS} {extra}"),
             Err(_) => BROWSER_ARGS.to_string(),
@@ -325,6 +330,7 @@ fn main() -> wry::Result<()> {
         toast::hook(&core, move |tag| {
             let _ = toast_proxy.send_event(UserEvent::ToastClicked(tag));
         });
+        let _ = webview.load_url(WHATSAPP_URL);
     }
 
     if start_hidden {

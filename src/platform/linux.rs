@@ -22,6 +22,89 @@ const DESKTOP_ID: &str = "litechat.desktop";
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
+/// Injected before page scripts when GStreamer's `autoaudiosink` plugin
+/// (`gst-plugins-good`) is missing. WebKitGTK 2.54+ aborts `WebKitWebProcess`
+/// inside `MediaPlayerPrivateGStreamer::createAudioSink()` whenever an
+/// `<audio>`/`<video>` element loads a source without `autoaudiosink`.
+pub const SILENT_MEDIA_GUARD_JS: &str = r#"(() => {
+  if (window.__litechatSilentMedia) return;
+  window.__litechatSilentMedia = true;
+  const noop = () => {};
+  const resolved = () => Promise.resolve();
+  class SilentAudio extends EventTarget {
+    constructor(src) {
+      super();
+      this._src = src ? String(src) : '';
+      this.volume = 1;
+      this.muted = true;
+      this.paused = true;
+      this.ended = true;
+      this.currentTime = 0;
+      this.duration = 0;
+      this.readyState = 4;
+      this.preload = 'none';
+    }
+    get src() { return this._src; }
+    set src(v) { this._src = v ? String(v) : ''; }
+    play() { return Promise.resolve(); }
+    pause() {}
+    load() {}
+    canPlayType() { return ''; }
+  }
+  try { window.Audio = SilentAudio; } catch (_) {}
+  if (typeof HTMLMediaElement !== 'undefined') {
+    const proto = HTMLMediaElement.prototype;
+    try { proto.play = resolved; } catch (_) {}
+    try { proto.pause = noop; } catch (_) {}
+    try { proto.load = noop; } catch (_) {}
+    try { proto.canPlayType = () => ''; } catch (_) {}
+    try {
+      Object.defineProperty(proto, 'src', {
+        configurable: true,
+        get() { return this._lcSrc || ''; },
+        set(v) { this._lcSrc = v ? String(v) : ''; },
+      });
+    } catch (_) {}
+    try {
+      Object.defineProperty(proto, 'srcObject', {
+        configurable: true,
+        get() { return this._lcSrcObj || null; },
+        set(v) { this._lcSrcObj = v; },
+      });
+    } catch (_) {}
+  }
+  if (typeof HTMLSourceElement !== 'undefined') {
+    try {
+      Object.defineProperty(HTMLSourceElement.prototype, 'src', {
+        configurable: true,
+        get() { return this._lcSrc || ''; },
+        set(v) { this._lcSrc = v ? String(v) : ''; },
+      });
+    } catch (_) {}
+  }
+  const origSetAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value) {
+    if (
+      String(name).toLowerCase() === 'src' &&
+      (this instanceof HTMLMediaElement ||
+        (typeof HTMLSourceElement !== 'undefined' && this instanceof HTMLSourceElement))
+    ) {
+      this._lcSrc = value ? String(value) : '';
+      return;
+    }
+    return origSetAttr.call(this, name, value);
+  };
+  const origCreateEl = Document.prototype.createElement;
+  Document.prototype.createElement = function(tagName, options) {
+    const el = origCreateEl.call(this, tagName, options);
+    if (typeof tagName === 'string' && tagName.toLowerCase() === 'audio') {
+      el.preload = 'none';
+      el.muted = true;
+    }
+    return el;
+  };
+})();"#;
+
 // ---------------------------------------------------------------------------
 // Data directory & external links
 // ---------------------------------------------------------------------------
