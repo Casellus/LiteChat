@@ -209,6 +209,9 @@ fn save_window_state(path: &Path, window: &Window) {
 }
 
 fn main() -> wry::Result<()> {
+    #[cfg(target_os = "linux")]
+    platform::init_env();
+
     // Set GTK program name so Wayland/X11 match litechat.desktop (icon + taskbar badge).
     #[cfg(target_os = "linux")]
     glib::set_prgname(Some("litechat"));

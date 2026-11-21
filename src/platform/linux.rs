@@ -9,9 +9,9 @@ use std::process::Command;
 
 use glib::ObjectExt;
 use webkit2gtk::{
-    CacheModel, ContextMenuAction, ContextMenuExt, ContextMenuItemExt,
-    HardwareAccelerationPolicy, NotificationPermissionRequest, PermissionRequestExt, SettingsExt,
-    UserMediaPermissionRequest, WebContextExt, WebViewExt,
+    ContextMenuAction, ContextMenuExt, ContextMenuItemExt, HardwareAccelerationPolicy,
+    NotificationPermissionRequest, PermissionRequestExt, SettingsExt,
+    UserMediaPermissionRequest, WebProcessTerminationReason, WebViewExt,
 };
 
 const APP_NAME: &str = "LiteChat";
@@ -20,6 +20,22 @@ const DESKTOP_ID: &str = "litechat.desktop";
 /// Chrome-on-Linux User-Agent so WhatsApp Web does not reject WebKitGTK.
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+/// Sets WebKitGTK environment workarounds before GTK/WebKit initializes.
+/// Must be called at the very start of `main()` before any threads are spawned.
+pub fn init_env() {
+    // WebKitGTK's DMA-BUF renderer freezes after idling or hiding on Wayland
+    // (especially on NVIDIA). Disable it by default on Wayland unless the user
+    // explicitly configured WEBKIT_DISABLE_DMABUF_RENDERER.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+    {
+        // SAFETY: called at process startup before any threads are spawned.
+        unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data directory & external links
@@ -212,12 +228,8 @@ fn is_whatsapp(uri: &str) -> bool {
 }
 
 /// Tunes WebKitGTK settings for WhatsApp Web (User-Agent, WebRTC, media stream,
-/// low-memory cache model, optional GPU disable).
+/// optional GPU disable, and automatic recovery if the web process terminates).
 pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
-    if let Some(ctx) = webview.context() {
-        ctx.set_cache_model(CacheModel::DocumentViewer);
-    }
-
     if let Some(settings) = WebViewExt::settings(webview) {
         settings.set_user_agent(Some(USER_AGENT));
         settings.set_enable_webrtc(true);
@@ -232,6 +244,17 @@ pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
             settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
         }
     }
+
+    // Automatically reload if WebKitWebProcess crashes or hits a memory limit while idle.
+    webview.connect_web_process_terminated(|wv, reason| {
+        if matches!(
+            reason,
+            WebProcessTerminationReason::Crashed
+                | WebProcessTerminationReason::ExceededMemoryLimit
+        ) {
+            wv.reload();
+        }
+    });
 }
 
 /// Grants notifications, microphone and camera to WhatsApp only, so calls and
@@ -300,8 +323,12 @@ pub fn clean_context_menu(webview: &webkit2gtk::WebView, is_debug: bool) {
     });
 }
 
-/// Hint WebKitGTK when hidden/shown.
+/// Trigger a redraw when restoring the window from the tray.
+/// Avoids calling `webview.set_visible(false)` while hidden, which tears down
+/// the Wayland surface and causes WebKitGTK to freeze after idling.
 pub fn set_low_memory(webview: &webkit2gtk::WebView, low: bool) {
     use gtk::prelude::WidgetExt;
-    webview.set_visible(!low);
+    if !low {
+        webview.queue_draw();
+    }
 }
