@@ -1,11 +1,12 @@
 //! Linux-specific integrations: single instance (Unix socket), XDG autostart,
 //! Unity/KDE taskbar badge (D-Bus), and WebKitGTK hooks (permissions, context menu).
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use glib::ObjectExt;
 use webkit2gtk::{
@@ -176,6 +177,13 @@ pub struct TaskbarBadge {
     bus: Option<gio::DBusConnection>,
 }
 
+fn launcher_entry_params(unread: u32) -> glib::Variant {
+    let props = glib::VariantDict::new(None);
+    props.insert("count", unread as i64);
+    props.insert("count-visible", unread > 0);
+    (format!("application://{DESKTOP_ID}"), props.end()).into()
+}
+
 impl TaskbarBadge {
     pub fn new() -> Self {
         let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok();
@@ -184,16 +192,13 @@ impl TaskbarBadge {
 
     pub fn set(&mut self, unread: u32) {
         let Some(bus) = &self.bus else { return };
-        let mut props: HashMap<&str, glib::Variant> = HashMap::new();
-        props.insert("count", (unread as i64).into());
-        props.insert("count-visible", (unread > 0).into());
-        let params = (format!("application://{DESKTOP_ID}"), props);
+        let params = launcher_entry_params(unread);
         let _ = bus.emit_signal(
             None,
             "/com/litechat/LiteChat",
             "com.canonical.Unity.LauncherEntry",
             "Update",
-            Some(&params.into()),
+            Some(&params),
         );
     }
 }
@@ -201,6 +206,52 @@ impl TaskbarBadge {
 // ---------------------------------------------------------------------------
 // WebKitGTK hooks (settings, permissions, context menu, memory)
 // ---------------------------------------------------------------------------
+
+/// Checks whether GStreamer's `autoaudiosink` plugin (`gst-plugins-good`) is
+/// installed. WebKitGTK 2.54+ aborts the web process inside `createAudioSink()`
+/// if a page plays audio while `autoaudiosink` is missing.
+pub fn has_gstreamer_audio_sink() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(detect_gstreamer_audio_sink)
+}
+
+fn detect_gstreamer_audio_sink() -> bool {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for var in [
+        "GST_PLUGIN_PATH_1_0",
+        "GST_PLUGIN_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GST_PLUGIN_SYSTEM_PATH",
+    ] {
+        if let Some(val) = std::env::var_os(var) {
+            dirs.extend(std::env::split_paths(&val));
+        }
+    }
+    for default_dir in [
+        "/usr/lib/gstreamer-1.0",
+        "/usr/lib64/gstreamer-1.0",
+        "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+        "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
+        "/usr/local/lib/gstreamer-1.0",
+    ] {
+        dirs.push(PathBuf::from(default_dir));
+    }
+
+    if dirs
+        .iter()
+        .any(|d| Path::new(d).join("libgstautodetect.so").is_file())
+    {
+        return true;
+    }
+
+    // Fallback for non-standard layouts (e.g. NixOS): ask gst-inspect-1.0 if present.
+    Command::new("gst-inspect-1.0")
+        .arg("autoaudiosink")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
 
 fn is_whatsapp(uri: &str) -> bool {
     let host = uri
@@ -214,10 +265,21 @@ fn is_whatsapp(uri: &str) -> bool {
 /// Tunes WebKitGTK settings for WhatsApp Web (User-Agent, WebRTC, media stream,
 /// optional GPU disable, and automatic recovery if the web process terminates).
 pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
+    let has_audio = has_gstreamer_audio_sink();
+    if !has_audio {
+        eprintln!(
+            "LiteChat: GStreamer 'autoaudiosink' (gst-plugins-good) not found; \
+             disabling WebKit media/WebAudio to prevent WebKitWebProcess crashes. \
+             Install gst-plugins-good to enable sound, voice messages, and calls."
+        );
+    }
+
     if let Some(settings) = WebViewExt::settings(webview) {
         settings.set_user_agent(Some(USER_AGENT));
-        settings.set_enable_webrtc(true);
-        settings.set_enable_media_stream(true);
+        settings.set_enable_webrtc(has_audio);
+        settings.set_enable_media_stream(has_audio);
+        settings.set_enable_media(has_audio);
+        settings.set_enable_webaudio(has_audio);
         settings.set_javascript_can_access_clipboard(true);
         settings.set_enable_developer_extras(is_debug);
 
@@ -229,14 +291,23 @@ pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
         }
     }
 
-    // Automatically reload if WebKitWebProcess crashes or hits a memory limit while idle.
-    webview.connect_web_process_terminated(|wv, reason| {
+    // Automatically reload if WebKitWebProcess crashes or hits a memory limit,
+    // rate-limited so repeated crashes cannot trigger a reload loop.
+    let last_reload = std::cell::Cell::new(None::<Instant>);
+    webview.connect_web_process_terminated(move |wv, reason| {
         if matches!(
             reason,
             WebProcessTerminationReason::Crashed
                 | WebProcessTerminationReason::ExceededMemoryLimit
         ) {
-            wv.reload();
+            let now = Instant::now();
+            let allow = last_reload
+                .get()
+                .is_none_or(|prev| now.duration_since(prev) >= Duration::from_secs(10));
+            if allow {
+                last_reload.set(Some(now));
+                wv.reload();
+            }
         }
     });
 }
@@ -314,5 +385,16 @@ pub fn set_low_memory(webview: &webkit2gtk::WebView, low: bool) {
     use gtk::prelude::WidgetExt;
     if !low {
         webview.queue_draw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_entry_variant_signature_is_valid_dbus_asv() {
+        let params = launcher_entry_params(3);
+        assert_eq!(params.type_().as_str(), "(sa{sv})");
     }
 }

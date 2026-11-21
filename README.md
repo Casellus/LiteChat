@@ -100,7 +100,7 @@ Without `-RemoveData` the session is kept in `%LOCALAPPDATA%\LiteChat`.
 
 ### Linux
 
-Requirements: GTK 3 and WebKitGTK 4.1 (`webkit2gtk-4.1` and `gtk3` development packages to build; `gst-plugins-good` is optional for voice message audio).
+Requirements: GTK 3 and WebKitGTK 4.1 (`webkit2gtk-4.1` and `gtk3` development packages to build). Install `gst-plugins-good` for audio, voice messages, and calls; if `autoaudiosink` is missing, LiteChat disables WebKit media playback automatically so WebKitGTK does not abort on audio events.
 
 ```bash
 git clone https://github.com/Casellus/LiteChat.git

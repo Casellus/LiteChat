@@ -32,26 +32,31 @@ pub fn register(icon_png: &[u8], data_dir: &Path) {
     }
 }
 
-fn send_notification(bus: &gio::DBusConnection, title: &str, body: &str) -> Option<u32> {
+fn build_notify_params(title: &str, body: &str, suppress_sound: bool) -> Variant {
     let icon = ICON_PATH.get().map(String::as_str).unwrap_or("litechat");
     let actions: Vec<&str> = vec!["default", "Open"];
-    let mut hints: HashMap<&str, Variant> = HashMap::new();
-    hints.insert("desktop-entry", "litechat".into());
-    // WhatsApp Web plays its own sound, so suppress the desktop sound to avoid a double ding.
-    hints.insert("suppress-sound", true.into());
-    hints.insert("category", "im.received".into());
+    let hints = glib::VariantDict::new(None);
+    hints.insert("desktop-entry", "litechat");
+    // Suppress the desktop sound only when WhatsApp Web can play its own chime.
+    hints.insert("suppress-sound", suppress_sound);
+    hints.insert("category", "im.received");
 
-    let params: Variant = (
+    (
         "LiteChat",
         0u32,
         icon,
         title,
         body,
         actions,
-        hints,
+        hints.end(),
         -1i32,
     )
-        .into();
+        .into()
+}
+
+fn send_notification(bus: &gio::DBusConnection, title: &str, body: &str) -> Option<u32> {
+    let suppress_sound = crate::platform::has_gstreamer_audio_sink();
+    let params = build_notify_params(title, body, suppress_sound);
 
     let reply = bus
         .call_sync(
@@ -157,5 +162,16 @@ pub fn clicked(tag: &str) {
     let Ok(id) = tag.parse::<u32>() else { return };
     if let Some(n) = ACTIVE.with(|a| a.borrow_mut().remove(&id)) {
         n.clicked();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_variant_signature_is_valid_dbus_asv() {
+        let params = build_notify_params("Alice", "Hello", true);
+        assert_eq!(params.type_().as_str(), "(susssasa{sv}i)");
     }
 }
