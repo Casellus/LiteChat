@@ -1316,6 +1316,7 @@ dependencies = [
  "glib",
  "gtk",
  "ksni",
+ "libc",
  "tao",
  "tray-icon",
  "webkit2gtk",

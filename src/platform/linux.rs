@@ -1,6 +1,7 @@
 //! Linux-specific integrations: single instance (Unix socket), XDG autostart,
 //! Unity/KDE taskbar badge (D-Bus), and WebKitGTK hooks (permissions, context menu).
 
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use glib::ObjectExt;
+use glib::object::ObjectType;
 use webkit2gtk::{
     ContextMenuAction, ContextMenuExt, ContextMenuItemExt, HardwareAccelerationPolicy,
     NotificationPermissionRequest, PermissionRequestExt, SettingsExt,
@@ -21,6 +23,134 @@ const DESKTOP_ID: &str = "litechat.desktop";
 /// Chrome-on-Linux User-Agent so WhatsApp Web does not reject WebKitGTK.
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+/// Raises `RLIMIT_NOFILE` at process startup so `WebKitWebProcess` inherits a
+/// high file-descriptor limit instead of systemd's default soft limit of 1024.
+/// Opening WhatsApp Web's GIF picker mounts dozens of simultaneous GStreamer
+/// `<video>` pipelines, which exhausts 1024 FDs (`EMFILE` in `GWakeup`).
+pub fn init_process() {
+    raise_nofile_limit();
+}
+
+fn raise_nofile_limit() {
+    const TARGET_NOFILE: libc::rlim_t = 65_536;
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `lim` is a valid mutable `libc::rlimit` struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        let desired = if lim.rlim_max == libc::RLIM_INFINITY {
+            TARGET_NOFILE
+        } else {
+            lim.rlim_max.min(TARGET_NOFILE)
+        };
+        if lim.rlim_cur < desired {
+            lim.rlim_cur = desired;
+            // SAFETY: raising soft limit up to `rlim_max` requires no extra privileges.
+            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+        }
+    }
+}
+
+/// Pauses off-screen muted looping `<video>` previews (WhatsApp's GIF picker
+/// and animated stickers) and resumes them when scrolled into view, avoiding
+/// dozens of simultaneous off-screen video decoders.
+pub const GIF_THROTTLE_JS: &str = r#"(() => {
+  if (window.__litechatGifThrottle) return;
+  window.__litechatGifThrottle = true;
+
+  const tracked = new Set();
+  const visible = new Set();
+
+  const isLoopingGif = (el) =>
+    el && el.tagName === 'VIDEO' && el.loop && el.muted && !el.controls;
+
+  const observer = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        const video = entry.target;
+        if (entry.isIntersecting) {
+          visible.add(video);
+          if (!document.hidden && video.paused && isLoopingGif(video)) {
+            video.play().catch(() => {});
+          }
+        } else {
+          visible.delete(video);
+          if (!video.paused && isLoopingGif(video)) {
+            video.pause();
+          }
+        }
+      }
+    },
+    { rootMargin: '120px' }
+  );
+
+  const watch = (el) => {
+    if (!isLoopingGif(el) || tracked.has(el)) return;
+    tracked.add(el);
+    observer.observe(el);
+  };
+
+  const unwatch = (el) => {
+    if (!tracked.has(el)) return;
+    tracked.delete(el);
+    visible.delete(el);
+    observer.unobserve(el);
+  };
+
+  const scan = (node, add) => {
+    if (!node || node.nodeType !== 1) return;
+    if (node.tagName === 'VIDEO') {
+      add ? watch(node) : unwatch(node);
+      return;
+    }
+    if (node.querySelectorAll) {
+      for (const v of node.querySelectorAll('video')) {
+        add ? watch(v) : unwatch(v);
+      }
+    }
+  };
+
+  const mo = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.type === 'childList') {
+        for (const n of m.addedNodes) scan(n, true);
+        for (const n of m.removedNodes) scan(n, false);
+      } else if (m.type === 'attributes' && m.target.tagName === 'VIDEO') {
+        if (isLoopingGif(m.target)) watch(m.target);
+        else unwatch(m.target);
+      }
+    }
+  });
+
+  const start = () => {
+    const root = document.documentElement || document.body;
+    if (!root) return;
+    scan(root, true);
+    mo.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['loop', 'muted', 'controls'],
+    });
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      for (const v of visible) {
+        if (!v.paused && isLoopingGif(v)) v.pause();
+      }
+    } else {
+      for (const v of visible) {
+        if (v.paused && isLoopingGif(v)) v.play().catch(() => {});
+      }
+    }
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();"#;
 
 /// Injected before page scripts when GStreamer's `autoaudiosink` plugin
 /// (`gst-plugins-good`) is missing. WebKitGTK 2.54+ aborts `WebKitWebProcess`
@@ -345,8 +475,105 @@ fn is_whatsapp(uri: &str) -> bool {
     host == "whatsapp.com" || host.ends_with(".whatsapp.com")
 }
 
-/// Tunes WebKitGTK settings for WhatsApp Web (User-Agent, WebRTC, media stream,
-/// optional GPU disable, and automatic recovery if the web process terminates).
+/// Applies WebKitGTK 2.42+ feature flags via `dlsym` so older distros still link
+/// cleanly while modern WebKitGTK unlocks native high-refresh-rate rendering
+/// (120/144 Hz+), GPU compositing, and threaded async scrolling.
+fn apply_performance_features(settings: &webkit2gtk::Settings, enable_gpu: bool) {
+    type GetAllFeaturesFn = unsafe extern "C" fn() -> *mut c_void;
+    type FeatureListLenFn = unsafe extern "C" fn(*mut c_void) -> usize;
+    type FeatureListGetFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+    type FeatureListUnrefFn = unsafe extern "C" fn(*mut c_void);
+    type FeatureGetIdentFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+    type SetFeatureEnabledFn = unsafe extern "C" fn(*mut c_void, *mut c_void, c_int);
+
+    unsafe fn sym(name: &CStr) -> *mut c_void {
+        // SAFETY: `name` is a valid NUL-terminated static C string.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }
+    }
+
+    // SAFETY: Each symbol is resolved by exact WebKitGTK C ABI name from the
+    // already-loaded `libwebkit2gtk-4.1.so.0` and checked for non-null before calling.
+    unsafe {
+        let p_get_all = sym(c"webkit_settings_get_all_features");
+        let p_len = sym(c"webkit_feature_list_get_length");
+        let p_get = sym(c"webkit_feature_list_get");
+        let p_unref = sym(c"webkit_feature_list_unref");
+        let p_ident = sym(c"webkit_feature_get_identifier");
+        let p_set = sym(c"webkit_settings_set_feature_enabled");
+
+        if p_get_all.is_null()
+            || p_len.is_null()
+            || p_get.is_null()
+            || p_unref.is_null()
+            || p_ident.is_null()
+            || p_set.is_null()
+        {
+            return;
+        }
+
+        let get_all: GetAllFeaturesFn = std::mem::transmute(p_get_all);
+        let list_len: FeatureListLenFn = std::mem::transmute(p_len);
+        let list_get: FeatureListGetFn = std::mem::transmute(p_get);
+        let list_unref: FeatureListUnrefFn = std::mem::transmute(p_unref);
+        let get_ident: FeatureGetIdentFn = std::mem::transmute(p_ident);
+        let set_enabled: SetFeatureEnabledFn = std::mem::transmute(p_set);
+
+        let list = get_all();
+        if list.is_null() {
+            return;
+        }
+
+        let desired: &[(&str, bool)] = if enable_gpu {
+            &[
+                // Unlock native 120Hz/144Hz+ refresh rate instead of throttling to 60fps.
+                ("PreferPageRenderingUpdatesNear60FPS", false),
+                ("ForceCompositingMode", true),
+                ("AcceleratedCompositingForFixedPosition", true),
+                ("AsyncFrameScrolling", true),
+                ("AsyncOverflowScrolling", true),
+                ("ThreadedScrolling", true),
+                ("MomentumScrollingAnimator", true),
+                ("ScrollAnimator", true),
+                ("UseDamagingInformationForCompositing", true),
+                ("AnimatedImageAsyncDecoding", true),
+                ("CanvasUsesAcceleratedDrawing", true),
+            ]
+        } else {
+            &[
+                ("PreferPageRenderingUpdatesNear60FPS", false),
+                ("AsyncFrameScrolling", true),
+                ("AsyncOverflowScrolling", true),
+                ("ThreadedScrolling", true),
+                ("MomentumScrollingAnimator", true),
+                ("ScrollAnimator", true),
+                ("AnimatedImageAsyncDecoding", true),
+            ]
+        };
+
+        let settings_ptr = settings.as_ptr() as *mut c_void;
+        let n = list_len(list);
+        for i in 0..n {
+            let feat = list_get(list, i);
+            if feat.is_null() {
+                continue;
+            }
+            let ident_ptr = get_ident(feat);
+            if ident_ptr.is_null() {
+                continue;
+            }
+            if let Ok(ident) = CStr::from_ptr(ident_ptr).to_str()
+                && let Some((_, enabled)) = desired.iter().find(|(k, _)| *k == ident)
+            {
+                set_enabled(settings_ptr, feat, i32::from(*enabled));
+            }
+        }
+        list_unref(list);
+    }
+}
+
+/// Tunes WebKitGTK settings for WhatsApp Web (User-Agent, high-FPS GPU
+/// compositing, smooth threaded scrolling, WebRTC/media, optional GPU disable,
+/// and automatic recovery if the web process terminates).
 pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
     let has_audio = has_gstreamer_audio_sink();
     if !has_audio {
@@ -358,20 +585,27 @@ pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
     }
 
     if let Some(settings) = WebViewExt::settings(webview) {
+        let disable_gpu = std::env::var("LITECHAT_DISABLE_GPU")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+
         settings.set_user_agent(Some(USER_AGENT));
         settings.set_enable_webrtc(has_audio);
         settings.set_enable_media_stream(has_audio);
         settings.set_enable_media(has_audio);
         settings.set_enable_webaudio(has_audio);
         settings.set_javascript_can_access_clipboard(true);
+        settings.set_enable_smooth_scrolling(true);
+        settings.set_enable_page_cache(true);
+        settings.set_enable_webgl(!disable_gpu);
+        settings.set_hardware_acceleration_policy(if disable_gpu {
+            HardwareAccelerationPolicy::Never
+        } else {
+            HardwareAccelerationPolicy::Always
+        });
         settings.set_enable_developer_extras(is_debug);
 
-        let disable_gpu = std::env::var("LITECHAT_DISABLE_GPU")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
-            .unwrap_or(false);
-        if disable_gpu {
-            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
-        }
+        apply_performance_features(&settings, !disable_gpu);
     }
 
     // Automatically reload if WebKitWebProcess crashes or hits a memory limit,
@@ -479,5 +713,63 @@ mod tests {
     fn launcher_entry_variant_signature_is_valid_dbus_asv() {
         let params = launcher_entry_params(3);
         assert_eq!(params.type_().as_str(), "(sa{sv})");
+    }
+
+    #[test]
+    fn nofile_limit_is_raised_above_default() {
+        raise_nofile_limit();
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        if lim.rlim_max >= 4096 {
+            assert!(lim.rlim_cur >= 4096, "rlim_cur was {}", lim.rlim_cur);
+        }
+    }
+
+    #[test]
+    fn performance_features_unlock_high_refresh_rate() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let settings = webkit2gtk::Settings::new();
+        apply_performance_features(&settings, true);
+
+        type GetAllFn = unsafe extern "C" fn() -> *mut c_void;
+        type LenFn = unsafe extern "C" fn(*mut c_void) -> usize;
+        type GetFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+        type UnrefFn = unsafe extern "C" fn(*mut c_void);
+        type IdentFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+        type GetEnabledFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+
+        unsafe {
+            let p_get_all = libc::dlsym(libc::RTLD_DEFAULT, c"webkit_settings_get_all_features".as_ptr());
+            if p_get_all.is_null() {
+                return; // WebKitGTK < 2.42
+            }
+            let get_all: GetAllFn = std::mem::transmute(p_get_all);
+            let list_len: LenFn = std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"webkit_feature_list_get_length".as_ptr()));
+            let list_get: GetFn = std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"webkit_feature_list_get".as_ptr()));
+            let list_unref: UnrefFn = std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"webkit_feature_list_unref".as_ptr()));
+            let get_ident: IdentFn = std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"webkit_feature_get_identifier".as_ptr()));
+            let get_enabled: GetEnabledFn = std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, c"webkit_settings_get_feature_enabled".as_ptr()));
+
+            let list = get_all();
+            let settings_ptr = settings.as_ptr() as *mut c_void;
+            let mut checked_60fps = false;
+            let mut checked_compositing = false;
+            for i in 0..list_len(list) {
+                let feat = list_get(list, i);
+                let ident = CStr::from_ptr(get_ident(feat)).to_str().unwrap_or("");
+                if ident == "PreferPageRenderingUpdatesNear60FPS" {
+                    assert_eq!(get_enabled(settings_ptr, feat), 0);
+                    checked_60fps = true;
+                } else if ident == "ForceCompositingMode" {
+                    assert_ne!(get_enabled(settings_ptr, feat), 0);
+                    checked_compositing = true;
+                }
+            }
+            list_unref(list);
+            assert!(checked_60fps, "PreferPageRenderingUpdatesNear60FPS feature not found");
+            assert!(checked_compositing, "ForceCompositingMode feature not found");
+        }
     }
 }

@@ -209,6 +209,9 @@ fn save_window_state(path: &Path, window: &Window) {
 }
 
 fn main() -> wry::Result<()> {
+    #[cfg(target_os = "linux")]
+    platform::init_process();
+
     // Set GTK program name so Wayland/X11 match litechat.desktop (icon + taskbar badge).
     #[cfg(target_os = "linux")]
     glib::set_prgname(Some("litechat"));
@@ -290,8 +293,12 @@ fn main() -> wry::Result<()> {
         });
 
     #[cfg(target_os = "linux")]
-    if !platform::has_gstreamer_audio_sink() {
-        wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
+    {
+        if !platform::has_gstreamer_audio_sink() {
+            wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
+        } else {
+            wv_builder = wv_builder.with_initialization_script(platform::GIF_THROTTLE_JS);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -376,13 +383,13 @@ fn main() -> wry::Result<()> {
             }
             Event::UserEvent(UserEvent::Title(title)) => {
                 let count = unread_from_title(&title);
-                let label = if count > 0 {
-                    format!("({count}) {APP_NAME}")
-                } else {
-                    APP_NAME.to_string()
-                };
-                window.set_title(&label);
                 if count != unread {
+                    let label = if count > 0 {
+                        format!("({count}) {APP_NAME}")
+                    } else {
+                        APP_NAME.to_string()
+                    };
+                    window.set_title(&label);
                     if count > unread && !focused && window.is_visible() {
                         window.request_user_attention(Some(UserAttentionType::Informational));
                     }
@@ -394,11 +401,9 @@ fn main() -> wry::Result<()> {
                     if let Some(t) = &tray {
                         let rgba = badge::tray_icon_rgba(ICON_RGBA, ICON_SIZE, count);
                         t.set_icon(rgba, ICON_SIZE);
+                        t.set_tooltip(&label);
                     }
                     unread = count;
-                }
-                if let Some(t) = &tray {
-                    t.set_tooltip(&label);
                 }
             }
             Event::UserEvent(UserEvent::Tray(cmd)) => match cmd {
