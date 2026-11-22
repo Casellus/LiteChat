@@ -29,18 +29,16 @@ const USER_AGENT: &str =
 pub fn init_process() {
     raise_nofile_limit();
 
-    // On NVIDIA proprietary drivers, WebKitGTK's GStreamer GL/DMA-BUF video
-    // sinks can produce solid green (#008800, all-zero YUV) flashing frames for
-    // `<video>` GIFs. Falling back to WebKit's standard video texture upload
-    // fixes video colors while keeping full GPU acceleration for the WebView.
-    if Path::new("/proc/driver/nvidia/version").exists() {
-        for var in ["WEBKIT_GST_DISABLE_GL_SINK", "WEBKIT_GST_DMABUF_SINK_DISABLED"] {
-            if std::env::var_os(var).is_none() {
-                // SAFETY: called at process startup before any threads are spawned.
-                unsafe {
-                    std::env::set_var(var, "1");
-                }
-            }
+    // On NVIDIA proprietary drivers, WebKitGTK's GStreamer GL video sink can
+    // produce solid green (#008800, all-zero YUV) flashing frames for `<video>`
+    // GIFs. Disabling only the GL sink lets WebKitGTK use its DMA-BUF/standard
+    // video path cleanly while keeping full GPU acceleration for the WebView.
+    if Path::new("/proc/driver/nvidia/version").exists()
+        && std::env::var_os("WEBKIT_GST_DISABLE_GL_SINK").is_none()
+    {
+        // SAFETY: called at process startup before any threads are spawned.
+        unsafe {
+            std::env::set_var("WEBKIT_GST_DISABLE_GL_SINK", "1");
         }
     }
 }
@@ -182,8 +180,11 @@ pub const GIF_THROTTLE_JS: &str = r#"(() => {
   const tracked = new WeakSet();
   const visible = new Set();
 
-  const isLoopingGif = (el) =>
-    el && el.tagName === 'VIDEO' && el.loop && el.muted && !el.controls;
+  const isLoopingGif = (el) => {
+    if (!el || el.tagName !== 'VIDEO' || !el.loop || !el.muted || el.controls) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.width <= 320 && rect.height <= 320;
+  };
 
   const observer = new IntersectionObserver(
     (entries) => {
@@ -613,8 +614,6 @@ fn apply_performance_features(settings: &webkit2gtk::Settings, enable_gpu: bool)
             &[
                 // Unlock native 120Hz/144Hz+ refresh rate instead of throttling to 60fps.
                 ("PreferPageRenderingUpdatesNear60FPS", false),
-                ("ForceCompositingMode", true),
-                ("AcceleratedCompositingForFixedPosition", true),
                 ("AsyncFrameScrolling", true),
                 ("AsyncOverflowScrolling", true),
                 ("ThreadedScrolling", true),
@@ -680,6 +679,8 @@ pub fn configure_webview(webview: &webkit2gtk::WebView, is_debug: bool) {
         settings.set_enable_media_stream(has_audio);
         settings.set_enable_media(has_audio);
         settings.set_enable_webaudio(has_audio);
+        settings.set_media_playback_requires_user_gesture(false);
+        settings.set_media_playback_allows_inline(true);
         settings.set_javascript_can_access_clipboard(true);
         settings.set_enable_smooth_scrolling(true);
         settings.set_enable_page_cache(true);
@@ -791,6 +792,150 @@ pub fn set_low_memory(webview: &webkit2gtk::WebView, low: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File drag-and-drop bridge (Wayland + bwrap sandbox)
+// ---------------------------------------------------------------------------
+
+const MAX_DROP_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const DROP_CHUNK_BYTES: usize = 3 * 1024 * 1024; // multiple of 3 for clean base64 chunks
+
+fn mime_from_path(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("3gp") => "video/3gpp",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg" | "oga" | "opus") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn js_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Injects local files dropped onto the GTK window as a synthetic HTML5 `drop`
+/// event with real `File` objects. Needed on Wayland + WebKitGTK `bwrap`
+/// sandbox, where `WebKitWebProcess` cannot read arbitrary paths from Dolphin.
+pub fn inject_dropped_files(webview: &wry::WebView, paths: &[PathBuf], position: (i32, i32)) {
+    let mut valid_files = Vec::new();
+    for path in paths {
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DROP_FILE_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime = mime_from_path(path);
+        valid_files.push((name, mime, bytes));
+    }
+    if valid_files.is_empty() {
+        return;
+    }
+
+    let _ = webview.evaluate_script("window.__lcDropFiles = [];");
+    for (name, mime, bytes) in valid_files {
+        let _ = webview.evaluate_script("window.__lcDropChunks = [];");
+        for chunk in bytes.chunks(DROP_CHUNK_BYTES) {
+            let b64 = encode_base64(chunk);
+            let _ = webview.evaluate_script(&format!("window.__lcDropChunks.push('{b64}');"));
+        }
+        let finalize_file = format!(
+            "(() => {{\
+               const parts = window.__lcDropChunks.map((b64) => {{\
+                 const bin = atob(b64);\
+                 const arr = new Uint8Array(bin.length);\
+                 for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);\
+                 return arr;\
+               }});\
+               window.__lcDropChunks = [];\
+               window.__lcDropFiles.push(new File(parts, {}, {{ type: {} }}));\
+             }})();",
+            js_escape_string(&name),
+            js_escape_string(mime),
+        );
+        let _ = webview.evaluate_script(&finalize_file);
+    }
+
+    let (x, y) = position;
+    let dispatch = format!(
+        "(() => {{\
+           const files = window.__lcDropFiles || [];\
+           window.__lcDropFiles = [];\
+           if (!files.length) return;\
+           const dt = new DataTransfer();\
+           for (const f of files) dt.items.add(f);\
+           const el = document.elementFromPoint({x}, {y})\
+             || document.querySelector('#main')\
+             || document.body;\
+           if (!el) return;\
+           const opts = {{ bubbles: true, cancelable: true, dataTransfer: dt, clientX: {x}, clientY: {y} }};\
+           el.dispatchEvent(new DragEvent('dragenter', opts));\
+           el.dispatchEvent(new DragEvent('dragover', opts));\
+           el.dispatchEvent(new DragEvent('drop', opts));\
+         }})();"
+    );
+    let _ = webview.evaluate_script(&dispatch);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +954,17 @@ mod tests {
         if lim.rlim_max >= 4096 {
             assert!(lim.rlim_cur >= 4096, "rlim_cur was {}", lim.rlim_cur);
         }
+    }
+
+    #[test]
+    fn base64_and_mime_work() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(mime_from_path(Path::new("/tmp/clip.MP4")), "video/mp4");
+        assert_eq!(mime_from_path(Path::new("/tmp/photo.webp")), "image/webp");
     }
 
     #[test]
@@ -841,21 +997,16 @@ mod tests {
             let list = get_all();
             let settings_ptr = settings.as_ptr() as *mut c_void;
             let mut checked_60fps = false;
-            let mut checked_compositing = false;
             for i in 0..list_len(list) {
                 let feat = list_get(list, i);
                 let ident = CStr::from_ptr(get_ident(feat)).to_str().unwrap_or("");
                 if ident == "PreferPageRenderingUpdatesNear60FPS" {
                     assert_eq!(get_enabled(settings_ptr, feat), 0);
                     checked_60fps = true;
-                } else if ident == "ForceCompositingMode" {
-                    assert_ne!(get_enabled(settings_ptr, feat), 0);
-                    checked_compositing = true;
                 }
             }
             list_unref(list);
             assert!(checked_60fps, "PreferPageRenderingUpdatesNear60FPS feature not found");
-            assert!(checked_compositing, "ForceCompositingMode feature not found");
         }
     }
 }

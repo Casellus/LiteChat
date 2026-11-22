@@ -67,6 +67,11 @@ enum UserEvent {
     Title(String),
     Show,
     ToastClicked(String),
+    #[cfg(target_os = "linux")]
+    FilesDropped {
+        paths: Vec<PathBuf>,
+        position: (i32, i32),
+    },
 }
 
 /// Domains that stay inside the app; everything else opens in the browser.
@@ -294,7 +299,16 @@ fn main() -> wry::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        wv_builder = wv_builder.with_initialization_script(platform::SMOOTH_SCROLL_JS);
+        let drop_proxy = event_loop.create_proxy();
+        wv_builder = wv_builder
+            .with_initialization_script(platform::SMOOTH_SCROLL_JS)
+            .with_drag_drop_handler(move |event| match event {
+                wry::DragDropEvent::Drop { paths, position } if !paths.is_empty() => {
+                    let _ = drop_proxy.send_event(UserEvent::FilesDropped { paths, position });
+                    true
+                }
+                _ => false,
+            });
         if !platform::has_gstreamer_audio_sink() {
             wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
         } else {
@@ -381,6 +395,10 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::ToastClicked(tag)) => {
                 show_window(&window, &webview);
                 toast::clicked(&tag);
+            }
+            #[cfg(target_os = "linux")]
+            Event::UserEvent(UserEvent::FilesDropped { paths, position }) => {
+                platform::inject_dropped_files(&webview, &paths, position);
             }
             Event::UserEvent(UserEvent::Title(title)) => {
                 let count = unread_from_title(&title);
