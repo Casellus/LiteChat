@@ -24,12 +24,25 @@ const DESKTOP_ID: &str = "litechat.desktop";
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
-/// Raises `RLIMIT_NOFILE` at process startup so `WebKitWebProcess` inherits a
-/// high file-descriptor limit instead of systemd's default soft limit of 1024.
-/// Opening WhatsApp Web's GIF picker mounts dozens of simultaneous GStreamer
-/// `<video>` pipelines, which exhausts 1024 FDs (`EMFILE` in `GWakeup`).
+/// Raises `RLIMIT_NOFILE` and applies Linux GPU/GStreamer workarounds at
+/// process startup before GTK/WebKit initializes or spawns child processes.
 pub fn init_process() {
     raise_nofile_limit();
+
+    // On NVIDIA proprietary drivers, WebKitGTK's GStreamer GL/DMA-BUF video
+    // sinks can produce solid green (#008800, all-zero YUV) flashing frames for
+    // `<video>` GIFs. Falling back to WebKit's standard video texture upload
+    // fixes video colors while keeping full GPU acceleration for the WebView.
+    if Path::new("/proc/driver/nvidia/version").exists() {
+        for var in ["WEBKIT_GST_DISABLE_GL_SINK", "WEBKIT_GST_DMABUF_SINK_DISABLED"] {
+            if std::env::var_os(var).is_none() {
+                // SAFETY: called at process startup before any threads are spawned.
+                unsafe {
+                    std::env::set_var(var, "1");
+                }
+            }
+        }
+    }
 }
 
 fn raise_nofile_limit() {
@@ -50,14 +63,123 @@ fn raise_nofile_limit() {
     }
 }
 
+/// Smooths discrete mouse-wheel scrolling on overflow containers (such as
+/// WhatsApp Web's virtualized chat list and message pane), where WebKitGTK
+/// otherwise jumps in abrupt stair-steps. Touchpad gestures, Ctrl/Meta zoom,
+/// horizontal scroll, and programmatic scroll jumps are left untouched.
+pub const SMOOTH_SCROLL_JS: &str = r#"(() => {
+  if (window.__litechatSmoothScroll) return;
+  window.__litechatSmoothScroll = true;
+
+  const states = new WeakMap();
+  const active = new Set();
+  let rafId = 0;
+  let lastTime = 0;
+
+  const findScrollable = (el, dy) => {
+    let cur = el;
+    while (cur && cur !== document.documentElement && cur !== document.body) {
+      if (cur.nodeType === 1 && cur.scrollHeight > cur.clientHeight + 1) {
+        const oy = getComputedStyle(cur).overflowY;
+        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') {
+          const max = cur.scrollHeight - cur.clientHeight;
+          if ((dy > 0 && cur.scrollTop < max - 0.5) || (dy < 0 && cur.scrollTop > 0.5)) {
+            return cur;
+          }
+        }
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  };
+
+  const step = (now) => {
+    const dt = lastTime ? Math.min(0.05, Math.max(0.001, (now - lastTime) / 1000)) : 1 / 60;
+    lastTime = now;
+    // Critically-damped exponential glide (~130ms settle, framerate-independent).
+    const factor = 1 - Math.exp(-dt * 18);
+
+    for (const el of active) {
+      const st = states.get(el);
+      if (!st || !el.isConnected) {
+        active.delete(el);
+        continue;
+      }
+      // If WhatsApp or the user's scrollbar moved scrollTop externally, stop smoothly.
+      if (Math.abs(el.scrollTop - st.lastApplied) > 2) {
+        active.delete(el);
+        continue;
+      }
+      const max = el.scrollHeight - el.clientHeight;
+      st.target = Math.max(0, Math.min(max, st.target));
+      const diff = st.target - st.current;
+      if (Math.abs(diff) < 0.4) {
+        st.current = st.target;
+        el.scrollTop = st.target;
+        st.lastApplied = el.scrollTop;
+        active.delete(el);
+      } else {
+        st.current += diff * factor;
+        el.scrollTop = st.current;
+        st.lastApplied = el.scrollTop;
+      }
+    }
+
+    if (active.size > 0) {
+      rafId = requestAnimationFrame(step);
+    } else {
+      rafId = 0;
+      lastTime = 0;
+    }
+  };
+
+  window.addEventListener(
+    'wheel',
+    (e) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.deltaY === 0) return;
+
+      let dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 32;
+      else if (e.deltaMode === 2) dy *= window.innerHeight * 0.85;
+
+      // High-precision touchpads emit small incremental pixel deltas: let WebKit handle them directly.
+      if (e.deltaMode === 0 && Math.abs(dy) < 20) return;
+
+      const target = findScrollable(e.target, dy);
+      if (!target) return;
+
+      e.preventDefault();
+      let st = states.get(target);
+      if (!st || !active.has(target) || Math.abs(target.scrollTop - st.lastApplied) > 2) {
+        st = {
+          current: target.scrollTop,
+          target: target.scrollTop,
+          lastApplied: target.scrollTop,
+        };
+        states.set(target, st);
+      }
+      const max = target.scrollHeight - target.clientHeight;
+      st.target = Math.max(0, Math.min(max, st.target + dy));
+      active.add(target);
+      if (!rafId) {
+        lastTime = 0;
+        rafId = requestAnimationFrame(step);
+      }
+    },
+    { passive: false, capture: true }
+  );
+})();"#;
+
 /// Pauses off-screen muted looping `<video>` previews (WhatsApp's GIF picker
-/// and animated stickers) and resumes them when scrolled into view, avoiding
-/// dozens of simultaneous off-screen video decoders.
+/// and animated stickers) and resumes them when scrolled into view. Uses a
+/// capture-phase `play` listener instead of a document-wide `MutationObserver`
+/// so scrolling virtualized chat lists incurs zero DOM observer overhead.
 pub const GIF_THROTTLE_JS: &str = r#"(() => {
   if (window.__litechatGifThrottle) return;
   window.__litechatGifThrottle = true;
 
-  const tracked = new Set();
+  const tracked = new WeakSet();
   const visible = new Set();
 
   const isLoopingGif = (el) =>
@@ -67,6 +189,11 @@ pub const GIF_THROTTLE_JS: &str = r#"(() => {
     (entries) => {
       for (const entry of entries) {
         const video = entry.target;
+        if (!video.isConnected) {
+          visible.delete(video);
+          observer.unobserve(video);
+          continue;
+        }
         if (entry.isIntersecting) {
           visible.add(video);
           if (!document.hidden && video.paused && isLoopingGif(video)) {
@@ -83,55 +210,16 @@ pub const GIF_THROTTLE_JS: &str = r#"(() => {
     { rootMargin: '120px' }
   );
 
-  const watch = (el) => {
-    if (!isLoopingGif(el) || tracked.has(el)) return;
-    tracked.add(el);
-    observer.observe(el);
-  };
-
-  const unwatch = (el) => {
-    if (!tracked.has(el)) return;
-    tracked.delete(el);
-    visible.delete(el);
-    observer.unobserve(el);
-  };
-
-  const scan = (node, add) => {
-    if (!node || node.nodeType !== 1) return;
-    if (node.tagName === 'VIDEO') {
-      add ? watch(node) : unwatch(node);
-      return;
-    }
-    if (node.querySelectorAll) {
-      for (const v of node.querySelectorAll('video')) {
-        add ? watch(v) : unwatch(v);
-      }
-    }
-  };
-
-  const mo = new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      if (m.type === 'childList') {
-        for (const n of m.addedNodes) scan(n, true);
-        for (const n of m.removedNodes) scan(n, false);
-      } else if (m.type === 'attributes' && m.target.tagName === 'VIDEO') {
-        if (isLoopingGif(m.target)) watch(m.target);
-        else unwatch(m.target);
-      }
-    }
-  });
-
-  const start = () => {
-    const root = document.documentElement || document.body;
-    if (!root) return;
-    scan(root, true);
-    mo.observe(root, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['loop', 'muted', 'controls'],
-    });
-  };
+  document.addEventListener(
+    'play',
+    (e) => {
+      const el = e.target;
+      if (!isLoopingGif(el) || tracked.has(el)) return;
+      tracked.add(el);
+      observer.observe(el);
+    },
+    true
+  );
 
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
@@ -140,16 +228,14 @@ pub const GIF_THROTTLE_JS: &str = r#"(() => {
       }
     } else {
       for (const v of visible) {
-        if (v.paused && isLoopingGif(v)) v.play().catch(() => {});
+        if (!v.isConnected) {
+          visible.delete(v);
+        } else if (v.paused && isLoopingGif(v)) {
+          v.play().catch(() => {});
+        }
       }
     }
   });
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
-  }
 })();"#;
 
 /// Injected before page scripts when GStreamer's `autoaudiosink` plugin

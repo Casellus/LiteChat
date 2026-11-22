@@ -294,6 +294,7 @@ fn main() -> wry::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        wv_builder = wv_builder.with_initialization_script(platform::SMOOTH_SCROLL_JS);
         if !platform::has_gstreamer_audio_sink() {
             wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
         } else {
