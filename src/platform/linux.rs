@@ -976,7 +976,30 @@ pub fn inject_dropped_files(webview: &wry::WebView, paths: &[PathBuf], position:
         return;
     }
 
-    let _ = webview.evaluate_script("window.__lcDropFiles = [];");
+    let _ = webview.evaluate_script(
+        "(() => {\
+           window.__lcDropFiles = [];\
+           if (!window.__lcSyntheticFiles) {\
+             window.__lcSyntheticFiles = new WeakSet();\
+             if (typeof DataTransferItem !== 'undefined') {\
+               const orig = DataTransferItem.prototype.webkitGetAsEntry;\
+               DataTransferItem.prototype.webkitGetAsEntry = function() {\
+                 const f = this.getAsFile && this.getAsFile();\
+                 if (f && window.__lcSyntheticFiles.has(f)) {\
+                   return {\
+                     isFile: true,\
+                     isDirectory: false,\
+                     name: f.name,\
+                     fullPath: '/' + f.name,\
+                     file: (ok, _err) => ok(f),\
+                   };\
+                 }\
+                 return orig ? orig.call(this) : null;\
+               };\
+             }\
+           }\
+         })();",
+    );
     for (name, mime, bytes) in valid_files {
         let _ = webview.evaluate_script("window.__lcDropChunks = [];");
         for chunk in bytes.chunks(DROP_CHUNK_BYTES) {
@@ -992,7 +1015,9 @@ pub fn inject_dropped_files(webview: &wry::WebView, paths: &[PathBuf], position:
                  return arr;\
                }});\
                window.__lcDropChunks = [];\
-               window.__lcDropFiles.push(new File(parts, {}, {{ type: {} }}));\
+               const f = new File(parts, {}, {{ type: {} }});\
+               window.__lcSyntheticFiles.add(f);\
+               window.__lcDropFiles.push(f);\
              }})();",
             js_escape_string(&name),
             js_escape_string(mime),
