@@ -793,11 +793,96 @@ pub fn set_low_memory(webview: &webkit2gtk::WebView, low: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// File drag-and-drop bridge (Wayland + bwrap sandbox)
+// File drag-and-drop bridge (Wayland + X11 + bwrap sandbox)
 // ---------------------------------------------------------------------------
 
 const MAX_DROP_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const DROP_CHUNK_BYTES: usize = 3 * 1024 * 1024; // multiple of 3 for clean base64 chunks
+
+fn percent_decode_uri_path(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    // Strip optional `localhost` hostname in `file://localhost/path`.
+    let raw = raw.strip_prefix("localhost").unwrap_or(raw);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex, 16)
+        {
+            out.push(val);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok().map(PathBuf::from)
+}
+
+/// Hooks GTK3 drag-and-drop directly on `WebKitWebView` so file drops work on
+/// both Wayland (where `text/uri-list` is only fetched after `drag-drop`) and
+/// X11, bypassing `wry`'s X11-only drag controller and WebKit's `bwrap` sandbox.
+pub fn connect_file_drop(
+    webview: &webkit2gtk::WebView,
+    on_drop: impl Fn(Vec<PathBuf>, (i32, i32)) + 'static,
+) {
+    use gtk::prelude::WidgetExt;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let drop_pos = Rc::new(Cell::new((0i32, 0i32)));
+    let pending_drop = Rc::new(Cell::new(false));
+
+    // Accept `text/uri-list` drags on Wayland/X11 so the compositor shows a
+    // valid drop cursor and delivers `drag-drop` even before data arrives.
+    webview.connect_drag_motion(move |wv, ctx, _x, _y, time| {
+        let uri_atom = gtk::gdk::Atom::intern("text/uri-list");
+        if ctx.list_targets().contains(&uri_atom) {
+            ctx.drag_status(gtk::gdk::DragAction::COPY, time);
+            glib::signal::signal_stop_emission_by_name(wv, "drag-motion");
+            return true;
+        }
+        false
+    });
+
+    let pos_drop = drop_pos.clone();
+    let pend_drop = pending_drop.clone();
+    webview.connect_drag_drop(move |wv, ctx, x, y, time| {
+        let uri_atom = gtk::gdk::Atom::intern("text/uri-list");
+        if ctx.list_targets().contains(&uri_atom) {
+            pos_drop.set((x, y));
+            pend_drop.set(true);
+            wv.drag_get_data(ctx, &uri_atom, time);
+            glib::signal::signal_stop_emission_by_name(wv, "drag-drop");
+            return true;
+        }
+        false
+    });
+
+    webview.connect_drag_data_received(move |wv, ctx, x, y, data, _info, time| {
+        if !pending_drop.get() {
+            return;
+        }
+        let uris = data.uris();
+        if uris.is_empty() {
+            return;
+        }
+        pending_drop.set(false);
+        let paths: Vec<PathBuf> = uris
+            .iter()
+            .filter_map(|u| percent_decode_uri_path(u.as_str()))
+            .collect();
+        ctx.drop_finish(!paths.is_empty(), time);
+        glib::signal::signal_stop_emission_by_name(wv, "drag-data-received");
+        if !paths.is_empty() {
+            let pos = if x != 0 || y != 0 { (x, y) } else { drop_pos.get() };
+            on_drop(paths, pos);
+        }
+    });
+}
 
 fn mime_from_path(path: &Path) -> &'static str {
     let ext = path
@@ -923,14 +1008,22 @@ pub fn inject_dropped_files(webview: &wry::WebView, paths: &[PathBuf], position:
            if (!files.length) return;\
            const dt = new DataTransfer();\
            for (const f of files) dt.items.add(f);\
-           const el = document.elementFromPoint({x}, {y})\
+           const pick = () =>\
+             document.elementFromPoint({x}, {y})\
              || document.querySelector('#main')\
              || document.body;\
+           const el = pick();\
            if (!el) return;\
-           const opts = {{ bubbles: true, cancelable: true, dataTransfer: dt, clientX: {x}, clientY: {y} }};\
-           el.dispatchEvent(new DragEvent('dragenter', opts));\
-           el.dispatchEvent(new DragEvent('dragover', opts));\
-           el.dispatchEvent(new DragEvent('drop', opts));\
+           const make = (type) => new DragEvent(type, {{\
+             bubbles: true, cancelable: true, dataTransfer: dt, clientX: {x}, clientY: {y}\
+           }});\
+           el.dispatchEvent(make('dragenter'));\
+           el.dispatchEvent(make('dragover'));\
+           requestAnimationFrame(() => requestAnimationFrame(() => {{\
+             const target = pick() || el;\
+             target.dispatchEvent(make('dragover'));\
+             target.dispatchEvent(make('drop'));\
+           }}));\
          }})();"
     );
     let _ = webview.evaluate_script(&dispatch);
@@ -965,6 +1058,10 @@ mod tests {
         assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
         assert_eq!(mime_from_path(Path::new("/tmp/clip.MP4")), "video/mp4");
         assert_eq!(mime_from_path(Path::new("/tmp/photo.webp")), "image/webp");
+        assert_eq!(
+            percent_decode_uri_path("file:///home/user/Meu%20V%C3%ADdeo.mp4"),
+            Some(PathBuf::from("/home/user/Meu Vídeo.mp4"))
+        );
     }
 
     #[test]

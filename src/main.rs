@@ -299,16 +299,7 @@ fn main() -> wry::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let drop_proxy = event_loop.create_proxy();
-        wv_builder = wv_builder
-            .with_initialization_script(platform::SMOOTH_SCROLL_JS)
-            .with_drag_drop_handler(move |event| match event {
-                wry::DragDropEvent::Drop { paths, position } if !paths.is_empty() => {
-                    let _ = drop_proxy.send_event(UserEvent::FilesDropped { paths, position });
-                    true
-                }
-                _ => false,
-            });
+        wv_builder = wv_builder.with_initialization_script(platform::SMOOTH_SCROLL_JS);
         if !platform::has_gstreamer_audio_sink() {
             wv_builder = wv_builder.with_initialization_script(platform::SILENT_MEDIA_GUARD_JS);
         } else {
@@ -348,6 +339,10 @@ fn main() -> wry::Result<()> {
         platform::configure_webview(&core, cfg!(debug_assertions));
         platform::auto_grant_permissions(&core);
         platform::clean_context_menu(&core, cfg!(debug_assertions));
+        let drop_proxy = event_loop.create_proxy();
+        platform::connect_file_drop(&core, move |paths, position| {
+            let _ = drop_proxy.send_event(UserEvent::FilesDropped { paths, position });
+        });
         let toast_proxy = event_loop.create_proxy();
         toast::hook(&core, move |tag| {
             let _ = toast_proxy.send_event(UserEvent::ToastClicked(tag));
