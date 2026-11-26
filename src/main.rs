@@ -36,13 +36,14 @@ const WHATSAPP_URL: &str = "https://web.whatsapp.com/";
 
 /// Extra WebView2 flags: turn off Edge services that are useless here
 /// and reduce background processes/memory.
-/// Measured: --disable-gpu ~ -95 MB (GPU process), --lite-mode ~ -160 MB (page),
-/// together ~ -43% RAM with no CPU increase.
+/// Measured: --disable-gpu ~ -95 MB (GPU process).
+/// Note: V8 `--lite-mode` would save another ~160 MB but removes WebAssembly,
+/// which WhatsApp needs for voice and video calls, so it must not be used.
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
 msEdgeTranslate,msShoppingTrigger,msEdgeCollections,AutofillServerCommunication \
 --disable-background-networking --disable-component-update --disable-sync \
 --no-first-run --disable-default-apps \
---disable-gpu --disable-gpu-compositing --js-flags=--lite-mode";
+--disable-gpu --disable-gpu-compositing";
 
 /// Clicking a WhatsApp notification brings the LiteChat window to the front.
 const NOTIFICATION_CLICK_JS: &str = r#"(() => {
@@ -269,8 +270,14 @@ fn main() -> wry::Result<()> {
             }
         })
         .with_new_window_req_handler(|url, _features| {
-            open_external(&url);
-            NewWindowResponse::Deny
+            // WhatsApp opens voice/video calls in their own window: keep those
+            // (and blank popups it fills via script) inside the app.
+            if url.is_empty() || url == "about:blank" || is_internal(&url) {
+                NewWindowResponse::Allow
+            } else {
+                open_external(&url);
+                NewWindowResponse::Deny
+            }
         })
         .with_document_title_changed_handler(move |title| {
             let _ = title_proxy.send_event(UserEvent::Title(title));

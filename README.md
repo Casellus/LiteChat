@@ -15,7 +15,7 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
 | | WhatsApp for Windows | LiteChat |
 |---|---|---|
 | Disk space | ~292 MB | **~0.7 MB** |
-| RAM with chats open* | ~1,150–1,690 MB | **~450 MB** |
+| RAM with chats open* | ~1,150–1,690 MB | **~600 MB** |
 
 \* Measured on the same PC and the same account, with chats already synced. The first login uses more memory for a few minutes while the chat history downloads.
 
@@ -35,7 +35,7 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
   - Notification widgets such as "dynamic island" apps can pick them up.
   - Clicking one opens LiteChat on that chat.
   - Reading the chat removes the notification.
-- **Calls and voice messages** work without extra prompts: microphone, camera, notification and clipboard permissions are granted to WhatsApp only.
+- **Voice and video calls** and voice messages work without extra prompts: microphone, camera, notification and clipboard permissions are granted to WhatsApp only. The call window opens inside LiteChat.
 - **Single instance**: launching LiteChat again just shows the existing window.
 - **Start with Windows** toggle in the tray menu. When started this way, it starts hidden in the tray.
 - Window size, position and maximized state are **remembered**.
@@ -48,8 +48,9 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
   | Option | Effect |
   |---|---|
   | `--disable-gpu` | GPU process drops from ~130 MB to ~18 MB |
-  | `--js-flags=--lite-mode` | page drops from ~465 MB to ~330 MB |
   | Edge services disabled | no translator, shopping, sync, etc. |
+
+  V8 `--lite-mode` would save another ~160 MB, but it removes WebAssembly, which WhatsApp needs for calls. LiteChat does not use it.
 
 ## Installation
 
