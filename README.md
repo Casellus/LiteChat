@@ -14,7 +14,7 @@ LiteChat opens the **official WhatsApp Web** in a native window. It uses the Web
 
 | | WhatsApp for Windows | LiteChat |
 |---|---|---|
-| Disk space | ~292 MB | **~0.7 MB** |
+| Disk space | ~292 MB | **~0.8 MB** |
 | RAM with chats open* | ~1,150–1,690 MB | **~600 MB** |
 
 \* Measured on the same PC and the same account, with chats already synced. The first login uses more memory for a few minutes while the chat history downloads.
