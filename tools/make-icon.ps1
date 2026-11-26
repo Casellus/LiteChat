@@ -1,4 +1,4 @@
-# Regenerates the LiteChat icon (white feather in a green bubble) into assets/:
+# Regenerates the LiteChat icon (white feather in a round speech bubble on a green circle) into assets/:
 #   litechat.ico (exe), icon64.rgba (window and tray), litechat.png (preview)
 #   powershell -ExecutionPolicy Bypass -File tools\make-icon.ps1
 param($outDir = (Join-Path $PSScriptRoot '..\assets'))
@@ -18,39 +18,41 @@ function Draw([int]$S) {
   $g.SmoothingMode = 'AntiAlias'; $g.PixelOffsetMode = 'HighQuality'; $g.Clear([Drawing.Color]::Transparent)
   $k = $S / 256.0
   function P($x,$y){ New-Object Drawing.PointF ([single]($x*$k)), ([single]($y*$k)) }
-  # bubble: rounded rectangle + tail at the bottom left
-  $r = 64; $x0=12; $y0=12; $x1=244; $y1=214
-  $bub = New-Object Drawing.Drawing2D.GraphicsPath
-  $bub.AddArc([single]($x0*$k),[single]($y0*$k),[single](2*$r*$k),[single](2*$r*$k),180,90)
-  $bub.AddArc([single](($x1-2*$r)*$k),[single]($y0*$k),[single](2*$r*$k),[single](2*$r*$k),270,90)
-  $bub.AddArc([single](($x1-2*$r)*$k),[single](($y1-2*$r)*$k),[single](2*$r*$k),[single](2*$r*$k),0,90)
-  $bub.AddLine((P 110 $y1),(P 72 248))
-  $bub.AddLine((P 72 248),(P 70 $y1))
-  $bub.AddArc([single]($x0*$k),[single](($y1-2*$r)*$k),[single](2*$r*$k),[single](2*$r*$k),90,90)
-  $bub.CloseFigure()
+  # feather coordinates are drawn scaled into the bubble
+  function F($x,$y){ P (130 + ($x-129)*0.56) (124 + ($y-117)*0.56) }
+  # round green background
   $rect = New-Object Drawing.RectangleF 0, 0, $S, $S
   $c1 = [Drawing.Color]::FromArgb(255,0x4A,0xDE,0x80); $c2 = [Drawing.Color]::FromArgb(255,0x0B,0x8A,0x5A)
   $grad = New-Object Drawing.Drawing2D.LinearGradientBrush $rect, $c1, $c2, ([single]60)
-  $g.FillPath($grad, $bub)
+  $g.FillEllipse($grad, [single](4*$k), [single](4*$k), [single](248*$k), [single](248*$k))
+  # round speech bubble outline with a tail at the bottom left
+  $r = 78; $cx = 130; $cy = 124
+  $ring = New-Object Drawing.Drawing2D.GraphicsPath
+  $ring.AddArc([single](($cx-$r)*$k), [single](($cy-$r)*$k), [single](2*$r*$k), [single](2*$r*$k), 150, 330)
+  $ring.AddLine((P 91 191.5), (P 52 214))
+  $ring.AddLine((P 52 214), (P 62.5 163))
+  $ring.CloseFigure()
+  $pen = New-Object Drawing.Pen ([Drawing.Brushes]::White), ([single]([Math]::Max(1.6, 15*$k)))
+  $pen.LineJoin = 'Round'
+  $g.DrawPath($pen, $ring)
   # feather: tilted drop-shaped vane
   $f = New-Object Drawing.Drawing2D.GraphicsPath
-  $f.AddBezier((P 78 176),(P 70 110),(P 130 52),(P 196 40))
-  $f.AddBezier((P 196 40),(P 190 104),(P 150 164),(P 78 176))
+  $f.AddBezier((F 78 176),(F 70 110),(F 130 52),(F 196 40))
+  $f.AddBezier((F 196 40),(F 190 104),(F 150 164),(F 78 176))
   $f.CloseFigure()
   $g.FillPath([Drawing.Brushes]::White, $f)
-  # side notches of the feather (background colour)
-  $cut = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(255,0x1F,0xA8,0x6A))
-  $g.FillPolygon($cut, [Drawing.PointF[]]@((P 94 108),(P 116 112),(P 92 122)))
-  $g.FillPolygon($cut, [Drawing.PointF[]]@((P 172 118),(P 150 120),(P 166 106)))
-  # shaft (quill) coming out at the bottom
+  $cut = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(255,0x22,0xB0,0x6E))
   if ($S -ge 32) {
-    $pen = New-Object Drawing.Pen $cut, ([single]([Math]::Max(1.2, 7*$k)))
-    $pen.StartCap = 'Round'; $pen.EndCap = 'Round'
-    $g.DrawBezier($pen, (P 182 56), (P 150 92), (P 116 134), (P 84 170))
+    # side notches and shaft
+    $g.FillPolygon($cut, [Drawing.PointF[]]@((F 94 108),(F 118 112),(F 92 124)))
+    $g.FillPolygon($cut, [Drawing.PointF[]]@((F 172 118),(F 148 120),(F 166 104)))
+    $sp = New-Object Drawing.Pen $cut, ([single]([Math]::Max(1.2, 7*0.56*$k)))
+    $sp.StartCap = 'Round'; $sp.EndCap = 'Round'
+    $g.DrawBezier($sp, (F 182 56), (F 150 92), (F 116 134), (F 84 170))
   }
-  $pw = New-Object Drawing.Pen ([Drawing.Brushes]::White), ([single]([Math]::Max(1.5, 9*$k)))
+  $pw = New-Object Drawing.Pen ([Drawing.Brushes]::White), ([single]([Math]::Max(1.2, 9*0.56*$k)))
   $pw.StartCap = 'Round'; $pw.EndCap = 'Round'
-  $g.DrawLine($pw, (P 84 170), (P 62 194))
+  $g.DrawLine($pw, (F 84 170), (F 60 196))
   $g.Dispose(); $bmp
 }
 # ICO: BMP entries for small sizes, PNG for 256 px
